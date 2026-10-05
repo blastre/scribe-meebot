@@ -1,0 +1,99 @@
+# Test values for automated LKE cluster provisioning.
+# No ingress, no TLS — uses NodePort to expose gateway + dashboard.
+# Usage: helm install scribe ./deploy/helm/charts/scribe -f ./deploy/helm/charts/scribe/values-test.yaml
+
+global:
+  imagePullPolicy: Always
+
+secrets:
+  adminApiToken: "test-admin-token-t3"
+
+# ---------- Components ----------
+
+apiGateway:
+  enabled: true
+  image:
+    repository: scribe/api-gateway
+    tag: dev
+  service:
+    type: NodePort
+    port: 8000
+    nodePort: 30056
+
+adminApi:
+  enabled: true
+  image:
+    repository: scribe/admin-api
+    tag: dev
+
+meetingApi:
+  enabled: true
+  botImageName: "scribe/scribe-bot:dev"
+  image:
+    repository: scribe/meeting-api
+    tag: dev
+
+runtimeApi:
+  enabled: true
+  orchestrator: kubernetes
+  browserImage: "scribe/scribe-bot:dev"
+  image:
+    repository: scribe/runtime-api
+    tag: dev
+
+ttsService:
+  # Not bundled in this repository — enable only if you supply your own image.
+  enabled: false
+  image:
+    repository: scribe/tts-service
+    tag: dev
+
+mcp:
+  # Not bundled in this repository — enable only if you supply your own image.
+  enabled: false
+  image:
+    repository: scribe/mcp
+    tag: dev
+
+dashboard:
+  enabled: true
+  image:
+    repository: scribe/dashboard
+    tag: dev
+  service:
+    type: NodePort
+    port: 3000
+    nodePort: 30001
+  env:
+    SCRIBE_PUBLIC_API_URL: ""       # set at install time via --set
+    NEXT_PUBLIC_APP_URL: ""       # set at install time via --set
+    NEXT_PUBLIC_HOSTED_MODE: "false"
+
+# Bundled deps
+postgres:
+  enabled: true
+  image: postgres:17-alpine
+  persistence:
+    enabled: true
+    size: 10Gi
+
+redis:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 2Gi
+
+minio:
+  enabled: true
+  persistence:
+    size: 10Gi
+
+# No ingress — NodePort only
+ingress:
+  enabled: false
+
+migrations:
+  enabled: true
+  image:
+    repository: scribe/meeting-api
+    tag: dev

@@ -1,0 +1,420 @@
+name: scribe
+services:
+  # --- Infrastructure ---
+
+  redis:
+    image: redis:7.0-alpine
+    mem_limit: 512m
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - redis-data:/data
+    networks:
+      - scribe
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    # idle_in_transaction_session_timeout=60s auto-kills orphaned transactions
+    # (defense-in-depth against future DB session leaks in meeting-api).
+    command: ["postgres", "-c", "idle_in_transaction_session_timeout=60000"]
+    environment:
+      - POSTGRES_DB=${DB_NAME:-scribe}
+      - POSTGRES_USER=${DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5458}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-scribe}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - scribe
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    mem_limit: 1g
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-scribe-access-key}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-scribe-secret-key}
+    ports:
+      # v0.10.5.3 Pack D-3 follow-up (Option B):
+      # MINIO_HOST_BIND defaults to 127.0.0.1 (safe — only the host can reach
+      # MinIO; presigned URLs only work for browsers running on the host).
+      # For external-browser audio playback (e.g. dashboard accessed from a
+      # remote machine), set MINIO_HOST_BIND=0.0.0.0 + set MINIO_PUBLIC_ENDPOINT
+      # to e.g. http://<host-public-ip>:${MINIO_HOST_PORT}. The presigned URL
+      # signature uses MINIO_PUBLIC_ENDPOINT; without that env, presigned URLs
+      # carry the in-network hostname `minio:9000` which only resolves inside
+      # the docker bridge network.
+      - "${MINIO_HOST_BIND:-127.0.0.1}:${MINIO_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - scribe
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sleep 5
+        mc alias set scribe http://minio:9000 $${MINIO_ROOT_USER:-scribe-access-key} $${MINIO_ROOT_PASSWORD:-scribe-secret-key}
+        mc mb --ignore-existing scribe/${MINIO_BUCKET:-scribe}
+        exit 0
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-scribe-access-key}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-scribe-secret-key}
+    networks:
+      - scribe
+
+  # --- Core services ---
+
+  admin-api:
+    build:
+      context: ../..
+      dockerfile: services/admin-api/Dockerfile
+    image: scribe/admin-api:${IMAGE_TAG}
+    ports:
+      - "127.0.0.1:${ADMIN_API_PORT:-8057}:8001"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-scribe}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_SSL_MODE=disable
+      - ADMIN_API_TOKEN=${ADMIN_TOKEN:-changeme}
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-scribe-internal-secret}
+      # Per-user concurrent-bot limit assigned to a NEW user at signup. Prevents
+      # a fresh account from being created with an unlimited (0) cap.
+      - DEFAULT_MAX_CONCURRENT_BOTS=${DEFAULT_MAX_CONCURRENT_BOTS:-2}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - scribe
+    restart: unless-stopped
+
+  runtime-api:
+    build:
+      context: ../../services/runtime-api
+      dockerfile: Dockerfile
+    image: scribe/runtime-api:${IMAGE_TAG}
+    group_add:
+      - "${DOCKER_GID:-998}"
+    ports:
+      - "127.0.0.1:${RUNTIME_API_PORT:-8090}:8090"
+    environment:
+      - DOCKER_NETWORK=${COMPOSE_PROJECT_NAME:-scribe}_scribe
+      - AGENT_IMAGE=${AGENT_IMAGE}
+      - BROWSER_IMAGE=${BROWSER_IMAGE}
+      - REDIS_URL=redis://redis:6379
+      - TRANSCRIPTION_SERVICE_URL=${TRANSCRIPTION_SERVICE_URL:-}
+      - TRANSCRIPTION_SERVICE_TOKEN=${TRANSCRIPTION_SERVICE_TOKEN:-}
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-scribe-internal-secret}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-minio:9000}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-scribe-access-key}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-scribe-secret-key}
+      - MINIO_BUCKET=${MINIO_BUCKET:-scribe}
+      - BOT_API_TOKEN=${BOT_API_TOKEN:-}
+      - API_KEYS=${BOT_API_TOKEN:-}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-scribe}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_SSL_MODE=disable
+      - PROFILES_PATH=/app/profiles.yaml
+      - ALLOW_PRIVATE_CALLBACKS=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../../services/runtime-api/profiles.yaml:/app/profiles.yaml:ro
+    init: true
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - scribe
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: ../..
+      dockerfile: services/api-gateway/Dockerfile
+    image: scribe/api-gateway:${IMAGE_TAG}
+    mem_limit: 1g
+    ports:
+      - "${API_GATEWAY_HOST_PORT:-8056}:8000"
+      - "8080:8000"        # extra fixed port for Cloudflare-Worker reachability (Workers block 8056)
+    environment:
+      - ADMIN_API_URL=http://admin-api:8001
+      - MEETING_API_URL=http://meeting-api:8080
+      - TRANSCRIPTION_COLLECTOR_URL=http://meeting-api:8080
+      - CALENDAR_SERVICE_URL=http://calendar-service:8050
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - REDIS_URL=redis://redis:6379/0
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-scribe-internal-secret}
+      # System key for the unauthenticated /public/google-meet endpoint (set by `make setup-api-key`).
+      - PUBLIC_BOT_API_KEY=${SCRIBE_API_KEY:-}
+      # Admin token — lets /public/join find-or-create a per-client user by email
+      # (the Cloudflare BFF "email + meeting link → bot joins" front door).
+      - ADMIN_API_TOKEN=${ADMIN_TOKEN:-changeme}
+      - DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME:-scribe meetbot}
+      - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-120}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    init: true
+    depends_on:
+      admin-api:
+        condition: service_healthy
+      meeting-api:
+        condition: service_started
+      redis:
+        condition: service_started
+    networks:
+      - scribe
+    restart: unless-stopped
+
+  meeting-api:
+    build:
+      context: ../..
+      dockerfile: services/meeting-api/Dockerfile
+    image: scribe/meeting-api:${IMAGE_TAG}
+    mem_limit: 1g
+    expose:
+      - "8080"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-scribe}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_SSL_MODE=disable
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ADMIN_TOKEN=${ADMIN_API_TOKEN:-changeme}
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-scribe-internal-secret}
+      # Global concurrency cap across ALL users — protects a fixed-capacity host.
+      # 0 = disabled (default). Set to the host's bot capacity (e.g. 7) in prod.
+      - GLOBAL_MAX_CONCURRENT_BOTS=${GLOBAL_MAX_CONCURRENT_BOTS:-0}
+      - RUNTIME_API_URL=http://runtime-api:8090
+      - RUNTIME_API_TOKEN=${BOT_API_TOKEN:-}
+      - MEETING_API_URL=http://meeting-api:8080
+      - BOT_IMAGE_NAME=${BROWSER_IMAGE}
+      - DOCKER_NETWORK=${COMPOSE_PROJECT_NAME:-scribe}_scribe
+      # agent-api is not shipped in this compose profile. Operators can opt in
+      # with POST_MEETING_HOOKS, but the default must not point at a disabled
+      # service or every completed meeting emits DNS errors before handoff.
+      - POST_MEETING_HOOKS=${POST_MEETING_HOOKS:-}
+      - TRANSCRIPTION_COLLECTOR_URL=http://meeting-api:8080
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-minio}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-minio:9000}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-scribe-access-key}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-scribe-secret-key}
+      - MINIO_BUCKET=${MINIO_BUCKET:-scribe}
+      - MINIO_SECURE=${MINIO_SECURE:-false}
+      # v0.10.5.3 Pack D-3 follow-up (Option B): browser-reachable MinIO
+      # endpoint for presigned download URLs. Default falls back to the
+      # internal hostname which works for in-network browsers (compose VM
+      # reachable on its own LAN). For external browser access set this
+      # to e.g. http://${HOST_PUBLIC_IP}:9000 in .env. storage.py uses
+      # this only when signing URLs; server-side I/O still uses
+      # MINIO_ENDPOINT for fast in-cluster reads.
+      - MINIO_PUBLIC_ENDPOINT=${MINIO_PUBLIC_ENDPOINT:-}
+      # Shared notetaker session path (S3/MinIO). When set, EVERY meeting bot
+      # joins signed-in as the one seeded notetaker Google account → no-knock
+      # admission. Seed it once via a browser_session login (see README), then
+      # point this at that session's path, e.g. users/<notetaker_user_id>/browser-userdata.
+      - NOTETAKER_S3_PATH=${NOTETAKER_S3_PATH:-}
+      - RECORDING_ENABLED=${RECORDING_ENABLED:-true}
+      - CAPTURE_MODES=${CAPTURE_MODES:-audio}
+      - AUDIO_RETENTION_DAYS=${AUDIO_RETENTION_DAYS:-7}
+      - TRANSCRIPTION_SERVICE_URL=${TRANSCRIPTION_SERVICE_URL:-}
+      - TRANSCRIPTION_SERVICE_TOKEN=${TRANSCRIPTION_SERVICE_TOKEN:-}
+      - TRANSCRIPTION_GATEWAY_URL=${TRANSCRIPTION_GATEWAY_URL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Default bot display name when a request omits bot_name
+      - DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME:-scribe meetbot}
+      # Cloudflare D1 transcript mirror (best-effort; off unless ENABLED=true)
+      - CLOUDFLARE_D1_ENABLED=${CLOUDFLARE_D1_ENABLED:-false}
+      - CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-}
+      - CF_D1_DATABASE_ID=${CF_D1_DATABASE_ID:-}
+      - CF_API_TOKEN=${CF_API_TOKEN:-}
+      - CF_D1_TABLE=${CF_D1_TABLE:-transcriptions}
+      # YouTube transcripts (POST /youtube/transcripts, /public/youtube). Captions
+      # first, Deepgram ASR fallback. Concurrency is capped low on purpose: yt-dlp
+      # + ffmpeg compete with meeting bots for a 4-core host, where each bot needs
+      # ~0.6 core sustained.
+      - YOUTUBE_MAX_CONCURRENT_JOBS=${YOUTUBE_MAX_CONCURRENT_JOBS:-1}
+      - YOUTUBE_MAX_DURATION_SECONDS=${YOUTUBE_MAX_DURATION_SECONDS:-14400}
+      - YOUTUBE_CAPTION_LANGS=${YOUTUBE_CAPTION_LANGS:-en,en-US,en-GB}
+      # YouTube blocks datacenter IPs outright — on EC2 even a plain watch-page
+      # GET is bot-gated, so no yt-dlp flag tuning helps. Set ONE of these or the
+      # YouTube endpoints fail on every video from a cloud host:
+      #   YOUTUBE_COOKIES_FILE — path INSIDE the container; put the cookies.txt at
+      #     the host path in YOUTUBE_COOKIES_HOST_FILE and it mounts read-only.
+      #     Use a throwaway Google account, never the notetaker one.
+      #   YOUTUBE_PROXY — residential/mobile egress, e.g. http://user:pass@host:port
+      - YOUTUBE_COOKIES_FILE=${YOUTUBE_COOKIES_FILE:-}
+      - YOUTUBE_PROXY=${YOUTUBE_PROXY:-}
+      - CF_D1_YOUTUBE_TABLE=${CF_D1_YOUTUBE_TABLE:-youtube_transcripts}
+      - CF_D1_YOUTUBE_SEGMENTS_TABLE=${CF_D1_YOUTUBE_SEGMENTS_TABLE:-youtube_transcript_segments}
+    volumes:
+      - ${LOCAL_STORAGE_VOLUME_SOURCE:-recordings-data}:/data/recordings
+      # YouTube cookies.txt, read-only. Defaults to mounting the compose file
+      # itself at an unused path — a harmless no-op that keeps the mount valid
+      # when no cookies are configured (compose has no conditional volumes).
+      - ${YOUTUBE_COOKIES_HOST_FILE:-./docker-compose.yml}:${YOUTUBE_COOKIES_FILE:-/tmp/.no-youtube-cookies}:ro
+    init: true
+    depends_on:
+      - redis
+      - postgres
+      - runtime-api
+    networks:
+      - scribe
+    restart: unless-stopped
+
+  # --- Optional services ---
+
+  # Calendar auto-join: polls each connected user's Google Calendar, finds Meet
+  # links, and dispatches a bot ~lead-time before each meeting — owned by that
+  # user (per-user isolation). Enable by setting GOOGLE_CLIENT_ID/SECRET and
+  # connecting a user's calendar (stores a refresh token in users.data).
+  calendar-service:
+    build:
+      context: ../..
+      dockerfile: services/calendar-service/Dockerfile
+    image: scribe/calendar-service:${IMAGE_TAG}
+    mem_limit: 512m
+    ports:
+      - "127.0.0.1:${CALENDAR_SERVICE_PORT:-8050}:8050"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-scribe}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_SSL_MODE=disable
+      - MEETING_API_URL=http://meeting-api:8080
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - CALENDAR_FRONTEND_URL=${CALENDAR_FRONTEND_URL:-}
+      - BOT_API_TOKEN=${BOT_API_TOKEN:-}
+      # System key the Cloudflare BFF uses to POST /calendar/oauth (store token).
+      - PUBLIC_BOT_API_KEY=${SCRIBE_API_KEY:-}
+      - CALENDAR_ALLOW_INSECURE_OAUTH=${CALENDAR_ALLOW_INSECURE_OAUTH:-false}
+      - DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME:-scribe meetbot}
+      - SYNC_INTERVAL_SECONDS=${CALENDAR_SYNC_INTERVAL_SECONDS:-300}
+      - DEFAULT_LEAD_TIME_MINUTES=${CALENDAR_LEAD_TIME_MINUTES:-2}
+      - CALENDAR_SYNC_WINDOW_DAYS=${CALENDAR_SYNC_WINDOW_DAYS:-30}
+      # Cloudflare D1 creds: calendar-service mirrors the multi-owner list
+      # (mirror_meeting_owners_to_d1) so every calendar attendee can see the
+      # meeting on the frontend. Without these the owners sink silently skips
+      # (_is_configured() → False) and the D1 meeting_owners table stays empty.
+      - CLOUDFLARE_D1_ENABLED=${CLOUDFLARE_D1_ENABLED:-false}
+      - CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-}
+      - CF_D1_DATABASE_ID=${CF_D1_DATABASE_ID:-}
+      - CF_API_TOKEN=${CF_API_TOKEN:-}
+      - CF_D1_SCHEDULES_TABLE=${CF_D1_SCHEDULES_TABLE:-schedules}
+      - CF_D1_CALENDAR_EVENTS_TABLE=${CF_D1_CALENDAR_EVENTS_TABLE:-calendar_events}
+      # Scheduler loop: polls D1 `schedules` (Worker-owned) ~once a minute and
+      # dispatches due rows to the real bot-launch endpoint on api-gateway.
+      - SCHEDULE_POLL_INTERVAL_SECONDS=${SCHEDULE_POLL_INTERVAL_SECONDS:-60}
+      - SCHEDULER_API_BASE_URL=${SCHEDULER_API_BASE_URL:-http://backend.example.com:8080}
+      - SCHEDULER_MAX_ATTEMPTS=${SCHEDULER_MAX_ATTEMPTS:-3}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    init: true
+    depends_on:
+      - postgres
+      - meeting-api
+    networks:
+      - scribe
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: services/dashboard/Dockerfile
+      # Release identity guard: the dashboard Dockerfile copies VERSION and
+      # Chart.yaml into the build and rejects a stale SCRIBE_VERSION override.
+      # Empty SCRIBE_VERSION is allowed; the generator then uses VERSION.
+      args:
+        NEXT_PUBLIC_SCRIBE_OSS_VERSION: ${SCRIBE_VERSION:-}
+        NEXT_PUBLIC_SCRIBE_OSS_RELEASE_DATE: ${SCRIBE_RELEASE_DATE:-}
+        SCRIBE_API_URL: http://api-gateway:8000
+    image: scribe/dashboard:${IMAGE_TAG}
+    mem_limit: 1g
+    ports:
+      - "${DASHBOARD_HOST_PORT:-3001}:3000"
+    environment:
+      - SCRIBE_API_URL=http://api-gateway:8000
+      - SCRIBE_PUBLIC_API_URL=${SCRIBE_PUBLIC_API_URL:-}
+      - API_GATEWAY_HOST_PORT=${API_GATEWAY_HOST_PORT:-8056}
+      - SCRIBE_API_KEY=${SCRIBE_API_KEY:-}
+      - SCRIBE_ADMIN_API_KEY=${ADMIN_API_TOKEN:-changeme}
+      - SCRIBE_ADMIN_API_URL=http://admin-api:8001
+      - JWT_SECRET=${JWT_SECRET:-scribe-dev-jwt-secret}
+      - SCRIBE_AUTH_COOKIE_NAME=${SCRIBE_AUTH_COOKIE_NAME:-scribe-token-compose}
+      - SCRIBE_USER_INFO_COOKIE_NAME=${SCRIBE_USER_INFO_COOKIE_NAME:-scribe-user-info-compose}
+      - SCRIBE_ALLOW_DIRECT_LOGIN=${SCRIBE_ALLOW_DIRECT_LOGIN:-true}
+      # Multi-user mode: when true, every data request requires a logged-in
+      # user's own token — no shared SCRIBE_API_KEY fallback (enforces per-user
+      # transcript isolation). Leave false for local/dev single-tenant use.
+      - SCRIBE_REQUIRE_AUTH=${SCRIBE_REQUIRE_AUTH:-false}
+      # Google OAuth SSO (NextAuth). Set all to enable "Sign in with Google".
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-}
+      - MINIO_INTERNAL_ENDPOINT=${MINIO_INTERNAL_ENDPOINT:-http://minio:9000}
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-}
+      - DEFAULT_BOT_NAME=${DEFAULT_BOT_NAME:-scribe meetbot}
+    init: true
+    depends_on:
+      - api-gateway
+    networks:
+      - scribe
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:
+  minio-data:
+  recordings-data:
+
+networks:
+  scribe:
+    driver: bridge

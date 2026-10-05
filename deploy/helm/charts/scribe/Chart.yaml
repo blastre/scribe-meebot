@@ -1,0 +1,15 @@
+apiVersion: v2
+name: scribe
+description: Scribe - self-hosted real-time meeting transcription platform
+type: application
+version: 0.10.6+3
+appVersion: "0.10.6.3.14"
+home: https://github.com/blastre/scribe-meetbot
+sources:
+  - https://github.com/blastre/scribe-meetbot
+keywords:
+  - scribe
+  - meeting-bot
+  - transcription
+maintainers:
+  - name: Scribe community
