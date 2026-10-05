@@ -1,0 +1,15 @@
+Scribe
+Copyright 2026 blastre
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This product includes software originally developed as part of the Vexa project
+(https://github.com/Vexa-ai/vexa), licensed under the Apache License, Version 2.0.
+
+Files in this repository have been changed from their original form. The
+deployment model, transcription pipeline, storage and mirroring layer, service
+topology, branding and supporting tooling all differ from the upstream project.
