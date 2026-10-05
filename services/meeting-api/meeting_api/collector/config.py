@@ -1,0 +1,72 @@
+import os
+
+# Configuration for Redis Stream consumer
+REDIS_STREAM_NAME = os.environ.get("REDIS_STREAM_NAME", "transcription_segments")
+REDIS_CONSUMER_GROUP = os.environ.get("REDIS_CONSUMER_GROUP", "collector_group")
+REDIS_STREAM_READ_COUNT = int(os.environ.get("REDIS_STREAM_READ_COUNT", "10"))
+REDIS_STREAM_BLOCK_MS = int(os.environ.get("REDIS_STREAM_BLOCK_MS", "2000"))  # 2 seconds
+# Use a fixed consumer name, potentially add hostname later if scaling replicas
+CONSUMER_NAME = os.environ.get("POD_NAME", "collector-main")  # Get POD_NAME from env if avail (k8s), else fixed
+PENDING_MSG_TIMEOUT_MS = 60000  # Milliseconds: Timeout after which pending messages are considered stale (e.g., 1 minute)
+
+# Configuration for Speaker Events Stream (NEW)
+REDIS_SPEAKER_EVENTS_STREAM_NAME = os.environ.get("REDIS_SPEAKER_EVENTS_STREAM_NAME", "speaker_events_relative")
+REDIS_SPEAKER_EVENTS_CONSUMER_GROUP = os.environ.get("REDIS_SPEAKER_EVENTS_CONSUMER_GROUP", "collector_speaker_group")
+REDIS_SPEAKER_EVENT_KEY_PREFIX = os.environ.get("REDIS_SPEAKER_EVENT_KEY_PREFIX", "speaker_events") # For sorted sets
+REDIS_SPEAKER_EVENT_TTL = int(os.environ.get("REDIS_SPEAKER_EVENT_TTL", "86400")) # 24 hours default TTL for speaker events sorted sets
+
+# Configuration for background processing
+BACKGROUND_TASK_INTERVAL = int(os.environ.get("BACKGROUND_TASK_INTERVAL", "10"))  # seconds
+IMMUTABILITY_THRESHOLD = int(os.environ.get("IMMUTABILITY_THRESHOLD", "30"))  # seconds
+REDIS_SEGMENT_TTL = int(os.environ.get("REDIS_SEGMENT_TTL", "3600"))  # 1 hour default TTL for Redis segments
+
+# Logging configuration
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# Security - API Key auth
+API_KEY_NAME = "X-API-Key"
+
+# Redis connection details
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", None)
+
+# Cloudflare D1 mirror — forward finalized transcript segments to a D1 database
+# in addition to Postgres. Best-effort: a D1 failure never blocks local writes.
+CLOUDFLARE_D1_ENABLED = os.environ.get("CLOUDFLARE_D1_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
+CF_D1_DATABASE_ID = os.environ.get("CF_D1_DATABASE_ID", "")
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
+CF_D1_TABLE = os.environ.get("CF_D1_TABLE", "transcriptions")
+CF_D1_TIMEOUT_SECONDS = float(os.environ.get("CF_D1_TIMEOUT_SECONDS", "10"))
+
+# Meetings mirror table — meeting-level state for Cloudflare-side dashboard
+# reads (status, lifecycle timestamps, segment counts, terminal classification).
+# Uses the same enable switch + credentials as the transcript mirror above.
+# See deploy/cloudflare-d1/schema_meetings.sql.
+CF_D1_MEETINGS_TABLE = os.environ.get("CF_D1_MEETINGS_TABLE", "meetings")
+
+# Meeting-owners mirror table — many-to-many (meeting_id, owner_email) so the
+# Cloudflare frontend can list a meeting for EVERY owner, not just the primary
+# owner_email stamped on transcript rows. See schema_meeting_owners.sql.
+CF_D1_OWNERS_TABLE = os.environ.get("CF_D1_OWNERS_TABLE", "meeting_owners")
+
+# Scheduled-meeting table — owned/auto-created by the Cloudflare Worker side.
+# calendar-service's scheduler loop polls it for due rows and dispatches them;
+# it never alters this table's schema.
+CF_D1_SCHEDULES_TABLE = os.environ.get("CF_D1_SCHEDULES_TABLE", "schedules")
+
+# Calendar-events mirror table — a synced copy of each user's Google Calendar
+# events (Google stays source of truth; calendar-service reconciles this on
+# every sync). Lets GET /calendar/meetings read from D1 instead of Postgres.
+# See deploy/cloudflare-d1/schema_calendar_events.sql.
+CF_D1_CALENDAR_EVENTS_TABLE = os.environ.get("CF_D1_CALENDAR_EVENTS_TABLE", "calendar_events")
+
+# YouTube transcript mirror — a metadata row per video plus its timed segments,
+# both carrying owner_email so the frontend can filter per client. Kept in their
+# own tables (not `meetings`/`transcriptions`) because a video has no bot,
+# session or participants. See deploy/cloudflare-d1/schema_youtube_transcripts.sql.
+CF_D1_YOUTUBE_TABLE = os.environ.get("CF_D1_YOUTUBE_TABLE", "youtube_transcripts")
+CF_D1_YOUTUBE_SEGMENTS_TABLE = os.environ.get(
+    "CF_D1_YOUTUBE_SEGMENTS_TABLE", "youtube_transcript_segments"
+)
