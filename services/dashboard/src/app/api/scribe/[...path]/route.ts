@@ -1,0 +1,218 @@
+import { NextRequest, NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { getAuthCookieName, getUserInfoCookieName } from "@/lib/auth-cookies";
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+async function proxyRequest(
+  request: NextRequest,
+  params: Promise<{ path: string[] }>,
+  method: string
+): Promise<NextResponse> {
+  const SCRIBE_API_URL = process.env.SCRIBE_API_URL;
+  if (!SCRIBE_API_URL) {
+    return NextResponse.json(
+      { error: "SCRIBE_API_URL is required; dashboard API proxy has no API SSOT" },
+      { status: 500 }
+    );
+  }
+
+  // Get user's token from HTTP-only cookie (set during login)
+  const cookieStore = await cookies();
+  const userToken = cookieStore.get(getAuthCookieName())?.value;
+
+  // Multi-user mode: when SCRIBE_REQUIRE_AUTH is on, every request MUST carry the
+  // logged-in user's own token — there is no shared-key fallback. This is what
+  // enforces per-user transcript isolation in the hosted product: without it,
+  // an unauthenticated visitor would silently act as the single shared
+  // SCRIBE_API_KEY system user and see that account's data. When the flag is off
+  // (local/dev/single-tenant), behaviour is unchanged: fall back to the env key
+  // so all endpoints work without a user session.
+  const requireAuth = ["1", "true", "yes"].includes(
+    (process.env.SCRIBE_REQUIRE_AUTH || "").toLowerCase()
+  );
+  if (requireAuth && !userToken) {
+    return NextResponse.json(
+      { error: "Not authenticated", detail: "Please log in." },
+      { status: 401, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+  const fallbackKey = requireAuth ? "" : process.env.SCRIBE_API_KEY || "";
+  const SCRIBE_API_KEY = userToken || fallbackKey;
+
+  const { path } = await params;
+  const pathString = path.join("/");
+
+  // /meetings list: primary source is GET /bots (meeting-api DB — all statuses).
+  // Fallback to /bots/status (running containers only) if /bots fails.
+  if (pathString === "meetings" && method === "GET") {
+    // Try GET /bots first — returns all meetings from DB (active + completed)
+    try {
+      const searchParams = request.nextUrl.searchParams;
+      const qs = new URLSearchParams();
+      qs.set("limit", searchParams.get("limit") || "50");
+      qs.set("offset", searchParams.get("offset") || "0");
+      if (searchParams.get("search")) qs.set("search", searchParams.get("search")!);
+      if (searchParams.get("status")) qs.set("status", searchParams.get("status")!);
+      if (searchParams.get("platform")) qs.set("platform", searchParams.get("platform")!);
+      const botsResp = await fetch(`${SCRIBE_API_URL}/bots?${qs.toString()}`, {
+        headers: { "X-API-Key": SCRIBE_API_KEY },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (botsResp.ok) {
+        const data = await botsResp.json();
+        return NextResponse.json({ meetings: data.meetings || [], has_more: data.has_more ?? false });
+      }
+    } catch (e) {
+      console.error("[proxy] GET /bots failed, falling back to /bots/status:", e);
+    }
+
+    // Fallback: running containers only (no history)
+    const meetings: Array<Record<string, unknown>> = [];
+    try {
+      const statusResp = await fetch(`${SCRIBE_API_URL}/bots/status`, {
+        headers: { "X-API-Key": SCRIBE_API_KEY },
+      });
+      if (statusResp.ok) {
+        const data = await statusResp.json();
+        for (const b of data.running_bots || []) {
+          if (!b.platform || !b.native_meeting_id) continue;
+          const id = b.meeting_id_from_name || b.container_name;
+          meetings.push({
+            id: parseInt(id) || 0,
+            platform: b.platform,
+            native_meeting_id: b.native_meeting_id,
+            status: b.meeting_status || "active",
+            start_time: b.start_time || b.created_at,
+            end_time: null,
+            data: b.data || {},
+            created_at: b.created_at,
+          });
+        }
+      }
+    } catch (e) {
+      console.error("[proxy] /bots/status failed:", e);
+    }
+    return NextResponse.json({ meetings });
+  }
+
+  // Everything else: proxy through api-gateway (handles /transcripts, /recordings, /bots, etc.)
+  if (!SCRIBE_API_KEY) {
+    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+  }
+
+  const upstreamSearchParams = new URLSearchParams(request.nextUrl.searchParams);
+  upstreamSearchParams.delete("proxy");
+  const searchParams = upstreamSearchParams.toString();
+  const url = `${SCRIBE_API_URL}/${pathString}${searchParams ? `?${searchParams}` : ""}`;
+
+  const headers: HeadersInit = {
+    "Content-Type": "application/json",
+  };
+
+  if (SCRIBE_API_KEY) {
+    headers["X-API-Key"] = SCRIBE_API_KEY;
+  }
+
+  const rangeHeader = request.headers.get("range");
+  if (rangeHeader) {
+    headers["Range"] = rangeHeader;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    const fetchOptions: RequestInit = {
+      method,
+      headers,
+      signal: controller.signal,
+    };
+
+    if (method !== "GET" && method !== "HEAD") {
+      const body = await request.text();
+      if (body) {
+        fetchOptions.body = body;
+      }
+    }
+
+    const response = await fetch(url, { ...fetchOptions, cache: "no-store" });
+    clearTimeout(timeoutId);
+
+    const contentType = response.headers.get("content-type") || "";
+
+    if (contentType.includes("audio") || contentType.includes("video") || contentType.includes("octet-stream")) {
+      const mediaHeaders = new Headers({ "Cache-Control": "no-store" });
+      for (const header of [
+        "content-type",
+        "content-length",
+        "content-range",
+        "accept-ranges",
+        "content-disposition",
+      ]) {
+        const value = response.headers.get(header);
+        if (value) mediaHeaders.set(header, value);
+      }
+      return new NextResponse(response.body, {
+        status: response.status,
+        headers: mediaHeaders,
+      });
+    }
+
+    const data = await response.text();
+    const upstreamAuthRejected =
+      (response.status === 401 || response.status === 403) &&
+      /invalid api key|missing api key|not authenticated|unauthorized/i.test(data);
+
+    if (upstreamAuthRejected && userToken) {
+      cookieStore.delete(getAuthCookieName());
+      cookieStore.delete(getUserInfoCookieName());
+      return NextResponse.json(
+        { error: "Authentication failed", detail: "Your session may have expired. Please log in again." },
+        { status: 401, headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    try {
+      return NextResponse.json(JSON.parse(data), {
+        status: response.status,
+        headers: { "Cache-Control": "no-store" },
+      });
+    } catch {
+      return new NextResponse(data, {
+        status: response.status,
+        headers: { "Content-Type": contentType, "Cache-Control": "no-store" },
+      });
+    }
+  } catch (error) {
+    const err = error as Error;
+    if (err.name === "AbortError") {
+      return NextResponse.json({ error: "Request timeout" }, { status: 504 });
+    }
+    return NextResponse.json(
+      { error: `Failed to connect to API: ${err.message}` },
+      { status: 502 }
+    );
+  }
+}
+
+export async function GET(req: NextRequest, context: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, context.params, "GET");
+}
+
+export async function POST(req: NextRequest, context: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, context.params, "POST");
+}
+
+export async function PUT(req: NextRequest, context: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, context.params, "PUT");
+}
+
+export async function DELETE(req: NextRequest, context: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, context.params, "DELETE");
+}
+
+export async function PATCH(req: NextRequest, context: { params: Promise<{ path: string[] }> }) {
+  return proxyRequest(req, context.params, "PATCH");
+}
