@@ -1,0 +1,52 @@
+---
+title: "Scribe Dashboard"
+---
+Scribe Dashboard is an **open-source** Next.js web UI for Scribe. It's a fully functional application for joining meetings, viewing live transcripts, managing users/tokens, and reviewing transcript history — and it's also a great starting point for building your own integration.
+
+**Fork it, use it as a reference, or build on top of it.**
+
+Location: [`services/dashboard/`](https://github.com/blastre/scribe-meetbot/tree/main/services/dashboard) in the Scribe monorepo
+
+## Use It as a Reference
+
+The dashboard codebase contains working examples of how to integrate with the Scribe API and WebSocket. Use these as code snippets or patterns for building your own application:
+
+| What | File | Description |
+|------|------|-------------|
+| **REST API client** | [`src/lib/api.ts`](https://github.com/blastre/scribe-meetbot/blob/main/services/dashboard/src/lib/api.ts) | API wrapper for bots, meetings, transcripts, recordings |
+| **WebSocket hook** | [`src/hooks/use-scribe-websocket.ts`](https://github.com/blastre/scribe-meetbot/blob/main/services/dashboard/src/hooks/use-scribe-websocket.ts) | React hook for WebSocket connection, subscription, and message handling |
+| **Live transcripts** | [`src/hooks/use-live-transcripts.ts`](https://github.com/blastre/scribe-meetbot/blob/main/services/dashboard/src/hooks/use-live-transcripts.ts) | Real-time transcript rendering with deduplication and speaker grouping |
+| **Meetings store** | [`src/stores/meetings-store.ts`](https://github.com/blastre/scribe-meetbot/blob/main/services/dashboard/src/stores/meetings-store.ts) | Zustand store for meeting state management |
+| **Meeting detail page** | [`src/app/meetings/[id]/page.tsx`](https://github.com/blastre/scribe-meetbot/blob/main/services/dashboard/src/app/meetings/%5Bid%5D/page.tsx) | Full meeting view with transcript, recording playback, and metadata |
+| **API config route** | [`src/app/api/config/route.ts`](https://github.com/blastre/scribe-meetbot/blob/main/services/dashboard/src/app/api/config/route.ts) | Server-side API configuration and proxying |
+
+## What You Need
+
+- A reachable Scribe API Gateway URL (typically `http://<host>:8056`)
+- The Scribe **Admin API token** (the `ADMIN_API_TOKEN` from your Scribe deployment, set as `SCRIBE_ADMIN_API_KEY` in the dashboard)
+
+## Run With Docker
+
+```bash
+docker run --rm -p 3000:3000 \
+  -e SCRIBE_API_URL=http://your-scribe-host:8056 \
+  -e SCRIBE_ADMIN_API_KEY=your_admin_api_token \
+  scribe/scribe-dashboard:latest
+```
+
+> **Production:** Use immutable tags (e.g., `0.10.0-260405-0108`) instead of `:latest` for reproducible deployments.
+
+Then open `http://localhost:3000`.
+
+## Local Development
+
+```bash
+git clone https://github.com/blastre/scribe-meetbot.git
+cd scribe/services/dashboard
+npm install
+cp .env.example .env.local
+# edit .env.local: SCRIBE_API_URL + SCRIBE_ADMIN_API_KEY
+npm run dev
+```
+
+Local dev server runs on `http://localhost:3001`.
