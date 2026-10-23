@@ -128,6 +128,10 @@ Full docs live in [`docs/`](./docs):
 Architecture and per-service detail: [`PRODUCT_OVERVIEW.md`](./PRODUCT_OVERVIEW.md)
 and the README in each `services/*` directory.
 
+## Architecture Diagram (GitDiagram)
+
+[![Architecture diagram of blastre/scribe-meebot](https://gitdiagram.com/blastre/scribe-meebot/diagram.png)](https://gitdiagram.com/blastre/scribe-meebot?utm_source=readme&utm_medium=picture)
+
 ## Development
 
 ```bash
